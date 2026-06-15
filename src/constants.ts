@@ -75,6 +75,8 @@ export const DEFAULT_SETTINGS = {
       },
     ],
     webContextMenu: false,
+    windowGeometry: null,
+    autoTriggerTemplateId: null,
   },
   mcpEnabled: true,
   mcpAuthToken: "",

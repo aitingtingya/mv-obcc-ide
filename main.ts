@@ -223,6 +223,10 @@ export default class MvObccIdePlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
+  refreshLlmFeature(): void {
+    this.llmFeature?.settingsChanged();
+  }
+
   async setSelectionHighlightsEnabled(enabled: boolean): Promise<void> {
     this.settings.preserveSelectionHighlights = enabled;
     this.selectionHighlighter?.setEnabled(enabled);

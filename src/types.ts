@@ -64,6 +64,17 @@ export interface LlmPromptTemplate {
   thinkingCustom?: string;
 }
 
+/**
+ * Persisted geometry of the LLM result popover (viewport-relative pixels).
+ * Null until the user first drags/resizes the window.
+ */
+export interface LlmWindowGeometry {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
 export interface LlmFeatureSettings {
   enabled: boolean;
   providers: LlmProviderConfig[];
@@ -73,6 +84,14 @@ export interface LlmFeatureSettings {
    * the page's native context menu). When false, webviewer relies on hotkeys.
    */
   webContextMenu: boolean;
+  /** Last known viewport-relative position/size of the popover, or null. */
+  windowGeometry: LlmWindowGeometry | null;
+  /**
+   * Id of an enabled template to auto-trigger on text selection when the
+   * session-level ribbon toggle is active. Null = auto-trigger disabled
+   * (and the ribbon button is hidden).
+   */
+  autoTriggerTemplateId: string | null;
 }
 
 export interface BridgeSettings {

@@ -6,6 +6,7 @@ import type {
   LlmProviderConfig,
   LlmProviderType,
   LlmThinkingMode,
+  LlmWindowGeometry,
 } from "./types";
 
 /**
@@ -123,7 +124,41 @@ export function migrateLlm(loaded: unknown): LlmFeatureSettings {
       typeof source.webContextMenu === "boolean"
         ? source.webContextMenu
         : base.webContextMenu,
+    windowGeometry: normalizeWindowGeometry(
+      (source as { windowGeometry?: unknown }).windowGeometry,
+    ),
+    autoTriggerTemplateId: normalizeAutoTriggerTemplateId(source, templates),
   };
+}
+
+function normalizeAutoTriggerTemplateId(
+  source: LegacyLlmSettings,
+  templates: LlmPromptTemplate[],
+): string | null {
+  const value = (source as { autoTriggerTemplateId?: unknown })
+    .autoTriggerTemplateId;
+  if (typeof value !== "string" || !value) return null;
+  return templates.some((template) => template.id === value && template.enabled)
+    ? value
+    : null;
+}
+
+/** Coerce an arbitrary persisted value into a valid geometry or null. */
+function normalizeWindowGeometry(raw: unknown): LlmWindowGeometry | null {
+  if (!raw || typeof raw !== "object") return null;
+  const g = raw as {
+    left?: unknown;
+    top?: unknown;
+    width?: unknown;
+    height?: unknown;
+  };
+  const left = Number(g.left);
+  const top = Number(g.top);
+  const width = Number(g.width);
+  const height = Number(g.height);
+  if (![left, top, width, height].every(Number.isFinite)) return null;
+  if (width < 50 || height < 50) return null; // implausible size; drop it
+  return { left, top, width, height };
 }
 
 /** Build the single "白山" provider from legacy flat fields. */

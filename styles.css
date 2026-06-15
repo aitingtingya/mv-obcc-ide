@@ -181,6 +181,24 @@
   background: var(--background-modifier-hover);
 }
 
+/* 左上角钉子按钮：固定/取消固定悬浮窗 */
+.mv-obcc-llm-pin {
+  font-size: 0; /* setIcon 渲染 SVG，去掉 × 那套字符尺寸 */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.mv-obcc-llm-pin svg {
+  width: 16px;
+  height: 16px;
+}
+.mv-obcc-llm-pin.is-pinned {
+  color: var(--text-accent);
+}
+.mv-obcc-llm-pin.is-pinned:hover {
+  color: var(--text-accent-hover);
+}
+
 .mv-obcc-llm-host {
   flex: 1 1 auto;
   min-height: 0;

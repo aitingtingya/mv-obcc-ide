@@ -14,7 +14,7 @@
 
 ### 方法一：手动从 Release 安装（推荐，适合非开发者）
 
-1. 前往 GitHub 仓库的 [Releases](https://github.com/aitingtingya/mv-obcc/releases) 页面，下载最新版本（如 `0.3.5`）的以下三个资产文件：
+1. 前往 GitHub 仓库的 [Releases](https://github.com/aitingtingya/mv-obcc/releases) 页面，下载最新版本（如 `0.3.7`）的以下三个资产文件：
    - `main.js`
    - `manifest.json`
    - `styles.css`
@@ -73,9 +73,11 @@
 3. **触发方式**：
    - **Markdown / Web Viewer 视图**：划词后，可以通过右键菜单选择 `LLM -> {您的模板}`，或者通过 Obsidian 的快捷键系统绑定相应的命令触发。
    - PDF视图：由于 PDF 视图右键菜单被 Obsidian 占用，默认只能使用快捷键触发。
+   - **自动触发**：可以在设置中指定一个已启用的提示词模板。指定后左侧功能区会出现“划词自动触发”按钮；每次启动默认关闭，点亮后仅在产生新选区时自动调用。
 4. **结果输出**：触发后会立即在窗口上方弹出**悬浮窗**，流式输出回答，并具有以下优化体验：
    - **不干扰操作**：生成回答时，您依然可以自由编辑或浏览原页面。
-   - **支持拖拽与缩放**：可以通过拖拽标题栏移动悬浮窗位置，并能拖动边缘自由调整大小。
+   - **支持拖拽与缩放**：可以通过拖拽标题栏移动悬浮窗位置，并能拖动边缘自由调整大小；位置和尺寸会被记住。
+   - **按需固定**：点击标题栏固定按钮后，后续调用会复用当前悬浮窗，插入或替换内容后也不会自动关闭；取消固定即可恢复默认行为。
    - **Markdown 原生预览与就地编辑**：悬浮窗内嵌了 Obsidian 原生的 Markdown 编辑器（后台使用单例临时文件支撑，该临时文件夹已自动在文件树和全局搜索中隐藏），为您提供原生的排版显示与直接编辑修改能力。
    - **便捷写入**：生成完毕后支持一键在原编辑器中“插入到光标处”或“替换选区”。
 
@@ -159,3 +161,8 @@ If you prefer to clone and compile the source code yourself:
 > - **PDF Reading**: Scanned PDF pages without text layers cannot be read.
 > - **Config Isolation**: Errors or issues with the LLM selection assistant will not affect the main Claude Code IDE bridge.
 > - **Desktop Permissions**: The plugin reads and updates Claude Code project settings, session metadata, and IDE lock files to manage the bridge. Process detection and MCP registration use Node.js `execFile` with explicit executables and arguments; the plugin does not construct or execute arbitrary shell commands.
+
+### LLM Assistant Interaction
+
+- Choose an enabled prompt template in settings to expose the **Selection auto-trigger** ribbon button. It starts disabled after every Obsidian launch and only fires when a new selection gesture is completed.
+- The floating result window remembers its position and size. Pin it from the title bar to reuse the same window for later requests and keep it open after insert or replace actions.

@@ -262,6 +262,7 @@ export class MvObccIdeSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.llm.enabled = value;
             await this.plugin.saveData(this.plugin.settings);
+            this.plugin.refreshLlmFeature();
             this.display();
           }),
       );
@@ -297,6 +298,40 @@ export class MvObccIdeSettingTab extends PluginSettingTab {
               );
             }),
         );
+
+      // ---- 悬浮窗行为 + 划词自动触发 ----
+      addHeading(containerEl, "悬浮窗与自动触发");
+
+      // 自动触发模板：下拉列出所有「已启用」的模板 + 一个「（关闭）」选项。
+      // 仅当存在至少一个已启用模板时才显示，否则给一条提示。
+      const enabledTemplates = this.plugin.settings.llm.templates.filter(
+        (t) => t.enabled,
+      );
+      if (enabledTemplates.length === 0) {
+        new Setting(containerEl)
+          .setName("划词自动触发模板")
+          .setDesc("当前没有已启用的模板，无法设置自动触发。请先在下方启用至少一个模板。");
+      } else {
+        new Setting(containerEl)
+          .setName("划词自动触发模板")
+          .setDesc(
+            "选择一个模板后，左侧功能区会出现「划词自动触发」按钮（点亮后才生效，每次启动默认关闭）。点亮后划词会自动用所选模板调用助手；所选模板若被关闭或删除，按钮会自动消失。",
+          )
+          .addDropdown((dropdown) => {
+            dropdown.addOption("", "（关闭）");
+            for (const tpl of enabledTemplates) {
+              dropdown.addOption(tpl.id, tpl.label);
+            }
+            dropdown.setValue(
+              this.plugin.settings.llm.autoTriggerTemplateId ?? "",
+            );
+            dropdown.onChange(async (value) => {
+              this.plugin.settings.llm.autoTriggerTemplateId = value || null;
+              await this.plugin.saveData(this.plugin.settings);
+              this.plugin.refreshLlmFeature();
+            });
+          });
+      }
 
       // ---- 提示词模板 ----
       addHeading(containerEl, "提示词模板");
@@ -780,7 +815,14 @@ export class MvObccIdeSettingTab extends PluginSettingTab {
       const target = this.plugin.settings.llm.templates[idx];
       if (!target) return;
       target.enabled = enableToggle.checked;
+      if (
+        !target.enabled &&
+        this.plugin.settings.llm.autoTriggerTemplateId === target.id
+      ) {
+        this.plugin.settings.llm.autoTriggerTemplateId = null;
+      }
       await this.plugin.saveData(this.plugin.settings);
+      this.plugin.refreshLlmFeature();
       new Notice(
         target.enabled ? `已启用：${target.label}` : `已关闭：${target.label}`,
         3000,
@@ -792,8 +834,15 @@ export class MvObccIdeSettingTab extends PluginSettingTab {
         .setIcon("trash")
         .setTooltip("删除该模板")
         .onClick(async () => {
-          this.plugin.settings.llm.templates.splice(idx, 1);
+          const [removed] = this.plugin.settings.llm.templates.splice(idx, 1);
+          if (
+            removed &&
+            this.plugin.settings.llm.autoTriggerTemplateId === removed.id
+          ) {
+            this.plugin.settings.llm.autoTriggerTemplateId = null;
+          }
           await this.plugin.saveData(this.plugin.settings);
+          this.plugin.refreshLlmFeature();
           this.display();
         }),
     );

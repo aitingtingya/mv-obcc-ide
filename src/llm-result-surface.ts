@@ -2,12 +2,14 @@ import {
   MarkdownView,
   Notice,
   WorkspaceSplit,
+  setIcon,
   type App,
   type Editor,
   type WorkspaceContainer,
   type WorkspaceLeaf,
 } from "obsidian";
 import { ensureTempFile } from "./llm-temp-file";
+import type { LlmWindowGeometry } from "./types";
 
 export type LlmResultState =
   | "opening"
@@ -25,9 +27,16 @@ export interface LlmResultSink {
 
 export interface LlmResultSurfaceOptions {
   document?: Document;
+  /**
+   * Optional viewport-relative geometry the popover should be born with.
+   * When omitted, the popover is centered in the viewport.
+   */
+  geometry?: LlmWindowGeometry;
   onInsert?: (text: string) => void;
   onReplace?: (text: string) => void;
   onClose?: () => void;
+  /** Fired after the user finishes dragging/resizing, with the new geometry. */
+  onGeometryChange?: (geometry: LlmWindowGeometry) => void;
 }
 
 interface WorkspaceWithFloating {
@@ -126,6 +135,7 @@ export class LlmResultSurface implements LlmResultSink {
   private titleEl: HTMLElement | null = null;
   private statusEl: HTMLElement | null = null;
   private hostEl: HTMLElement | null = null;
+  private toolbarEl: HTMLElement | null = null;
   private textarea: HTMLTextAreaElement | null = null;
   private split: WorkspaceSplit | null = null;
   private leaf: WorkspaceLeaf | null = null;
@@ -133,11 +143,18 @@ export class LlmResultSurface implements LlmResultSink {
   private initializing = false;
   private closeRequested = false;
   private closeNotified = false;
+  /**
+   * 运行时钉子状态：用户用标题栏左侧的 📌 切换。按下后，点「插入/替换」
+   * 不再自动关闭窗口，且再次划词调用会复用同一窗口（而非销毁重建）。
+   * 每个新窗口默认未钉。
+   */
+  private pinned = false;
+  private pinEl: HTMLElement | null = null;
   private cleanupFns: Array<() => void> = [];
 
   constructor(
     private readonly app: App,
-    private readonly options: LlmResultSurfaceOptions = {},
+    private options: LlmResultSurfaceOptions = {},
   ) {
     this.doc = options.document ?? app.workspace.containerEl.ownerDocument;
   }
@@ -174,6 +191,55 @@ export class LlmResultSurface implements LlmResultSink {
     this.renderStatus();
   }
 
+  /**
+   * Reset the surface for a new invocation, reusing the same window (used by
+   * the "persistent window" feature). Clears any buffered/streamed text and
+   * the error block, and flips the state back to streaming so the next
+   * `appendDelta` updates the same editor.
+   */
+  reset(): void {
+    this.buffer = "";
+    this.errorMessage = "";
+    this.fallbackReason = "";
+    this.state = "streaming";
+    if (this.editor) {
+      this.editor.setValue("");
+    }
+    if (this.textarea) {
+      this.textarea.value = "";
+    }
+    this.rootEl?.querySelector(".mv-obcc-llm-error")?.remove();
+    if (this.rootEl) this.activate(this.rootEl);
+    this.renderStatus();
+  }
+
+  /**
+   * Update the `onInsert`/`onReplace` callbacks and rebuild the toolbar so the
+   * "替换选区 / 插入到光标处" buttons bind to the NEW selection's edit target.
+   * Required by the persistent-window reuse path: without this, a reused
+   * window would keep the edit target from the first invocation.
+   */
+  updateCallbacks(
+    onInsert?: (text: string) => void,
+    onReplace?: (text: string) => void,
+  ): void {
+    this.options = { ...this.options, onInsert, onReplace };
+    const oldToolbar = this.toolbarEl;
+    if (!oldToolbar || !oldToolbar.parentNode) return;
+    const newToolbar = this.buildToolbar();
+    oldToolbar.parentNode.insertBefore(newToolbar, oldToolbar);
+    oldToolbar.remove();
+    this.toolbarEl = newToolbar;
+  }
+
+  /** Current viewport-relative geometry, or null when the window is gone. */
+  get currentGeometry(): LlmWindowGeometry | null {
+    const root = this.rootEl;
+    if (!root) return null;
+    const rect = root.getBoundingClientRect();
+    return { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+  }
+
   setDone(): void {
     if (this.state === "closed") return;
     this.state = "done";
@@ -207,6 +273,8 @@ export class LlmResultSurface implements LlmResultSink {
     this.titleEl = null;
     this.statusEl = null;
     this.hostEl = null;
+    this.toolbarEl = null;
+    this.pinEl = null;
     this.textarea = null;
     this.editor = null;
     if (!this.initializing) this.cleanupEmbeddedLeaf();
@@ -220,8 +288,35 @@ export class LlmResultSurface implements LlmResultSink {
     return this.state;
   }
 
+  get isOpen(): boolean {
+    return this.state !== "closed" && this.rootEl?.isConnected === true;
+  }
+
+  /** 当前是否被钉住（固定悬浮窗）。供外部复用判断读取。 */
+  get isPinned(): boolean {
+    return this.pinned;
+  }
+
   get usingFallback(): boolean {
     return this.textarea !== null;
+  }
+
+  /** 切换钉子状态，并同步按钮图标/样式。 */
+  private togglePinned(): void {
+    this.pinned = !this.pinned;
+    const el = this.pinEl;
+    if (el) {
+      this.renderPinIcon(el, this.pinned);
+      el.setAttribute("aria-pressed", String(this.pinned));
+    }
+  }
+
+  /** 根据钉住状态渲染对应图标（pin / pin-off）与激活样式。 */
+  private renderPinIcon(el: HTMLElement, pinned: boolean): void {
+    setIcon(el, pinned ? "pin" : "pin-off");
+    el.classList.toggle("is-pinned", pinned);
+    el.title = pinned ? "已固定：点击取消" : "点击固定悬浮窗";
+    el.setAttribute("aria-label", pinned ? "取消固定悬浮窗" : "固定悬浮窗");
   }
 
   private buildWindow(): void {
@@ -233,12 +328,27 @@ export class LlmResultSurface implements LlmResultSink {
     root.setAttribute("role", "dialog");
     root.setAttribute("aria-label", "LLM 结果");
     const viewport = viewportSize(this.doc);
-    const width = Math.min(450, Math.max(MIN_WIDTH, viewport.width - 24));
-    const height = Math.min(520, Math.max(MIN_HEIGHT, viewport.height - 24));
+    const geo = this.options.geometry;
+    const width = geo
+      ? Math.min(Math.max(MIN_WIDTH, geo.width), viewport.width)
+      : Math.min(450, Math.max(MIN_WIDTH, viewport.width - 24));
+    const height = geo
+      ? Math.min(Math.max(MIN_HEIGHT, geo.height), viewport.height)
+      : Math.min(520, Math.max(MIN_HEIGHT, viewport.height - 24));
     root.style.width = `${width}px`;
     root.style.height = `${height}px`;
-    root.style.left = `${Math.max(12, (viewport.width - width) / 2)}px`;
-    root.style.top = `${Math.max(12, (viewport.height - height) / 2)}px`;
+    if (geo) {
+      // Clamp remembered position into the current viewport so a resized
+      // window (e.g. after Obsidian restart with different layout) still shows.
+      root.style.left = `${Math.max(
+        0,
+        Math.min(geo.left, viewport.width - width),
+      )}px`;
+      root.style.top = `${Math.max(0, Math.min(geo.top, viewport.height - height))}px`;
+    } else {
+      root.style.left = `${Math.max(12, (viewport.width - width) / 2)}px`;
+      root.style.top = `${Math.max(12, (viewport.height - height) / 2)}px`;
+    }
     this.activate(root);
 
     const titlebar = createElement(
@@ -258,6 +368,16 @@ export class LlmResultSurface implements LlmResultSink {
       "mv-obcc-llm-status",
     );
     title.appendChild(status);
+    // 固定后插入/替换不会关闭窗口，下一次调用会复用当前窗口。
+    const pin = createElement(
+      this.doc,
+      "button",
+      "mv-obcc-llm-title-action mv-obcc-llm-pin",
+    );
+    pin.type = "button";
+    pin.setAttribute("aria-pressed", "false");
+    this.renderPinIcon(pin, this.pinned);
+    pin.addEventListener("click", () => this.togglePinned());
     const close = createElement(
       this.doc,
       "button",
@@ -267,7 +387,7 @@ export class LlmResultSurface implements LlmResultSink {
     close.type = "button";
     close.setAttribute("aria-label", "关闭");
     close.addEventListener("click", () => this.close());
-    titlebar.append(title, close);
+    titlebar.append(pin, title, close);
 
     const host = createElement(this.doc, "div", "mv-obcc-llm-host");
     const toolbar = this.buildToolbar();
@@ -279,6 +399,8 @@ export class LlmResultSurface implements LlmResultSink {
     this.titleEl = title;
     this.statusEl = status;
     this.hostEl = host;
+    this.toolbarEl = toolbar;
+    this.pinEl = pin;
     this.cleanupFns.push(this.installDrag(root, titlebar));
     this.cleanupFns.push(this.installActivation(root));
     this.renderStatus();
@@ -306,7 +428,7 @@ export class LlmResultSurface implements LlmResultSink {
       toolbar.appendChild(
         this.actionButton("替换选区", () => {
           this.options.onReplace?.(this.getCurrentText());
-          this.close();
+          if (!this.pinned) this.close();
         }),
       );
     }
@@ -314,7 +436,7 @@ export class LlmResultSurface implements LlmResultSink {
       toolbar.appendChild(
         this.actionButton("插入到光标处", () => {
           this.options.onInsert?.(this.getCurrentText());
-          this.close();
+          if (!this.pinned) this.close();
         }),
       );
     }
@@ -459,7 +581,11 @@ export class LlmResultSurface implements LlmResultSink {
       status.textContent = `调用失败${fallback}`;
       status.classList.add("mv-obcc-llm-status-error");
     }
-    if (this.fallbackReason) status.title = this.fallbackReason;
+    if (this.fallbackReason) {
+      status.title = this.fallbackReason;
+    } else {
+      status.removeAttribute("title");
+    }
   }
 
   private renderError(): void {
@@ -503,6 +629,11 @@ export class LlmResultSurface implements LlmResultSink {
     root.style.zIndex = String(surfaceLayer);
   }
 
+  private emitGeometry(): void {
+    const geo = this.currentGeometry;
+    if (geo) this.options.onGeometryChange?.(geo);
+  }
+
   private installDrag(
     root: HTMLElement,
     handle: HTMLElement,
@@ -537,6 +668,7 @@ export class LlmResultSurface implements LlmResultSink {
         ownerDoc.removeEventListener("pointermove", onMove);
         ownerDoc.removeEventListener("pointerup", onUp);
         this.leaf?.onResize();
+        this.emitGeometry();
       };
       ownerDoc.addEventListener("pointermove", onMove);
       ownerDoc.addEventListener("pointerup", onUp);
@@ -618,6 +750,7 @@ export class LlmResultSurface implements LlmResultSink {
         ownerDoc.removeEventListener("pointermove", onMove);
         ownerDoc.removeEventListener("pointerup", onUp);
         this.leaf?.onResize();
+        this.emitGeometry();
       };
       ownerDoc.addEventListener("pointermove", onMove);
       ownerDoc.addEventListener("pointerup", onUp);

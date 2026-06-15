@@ -14,6 +14,12 @@ import { getCommandHotkeys } from "./llm-hotkey-reader";
 import { LlmResultSurface } from "./llm-result-surface";
 import { registerTempIgnoreFilter } from "./llm-temp-file";
 import {
+  llmWebAutoTriggerCleanupScript,
+  llmWebAutoTriggerInstallScript,
+  llmWebAutoTriggerPollScript,
+  type LlmWebAutoTriggerPending,
+} from "./llm-web-autotrigger-script";
+import {
   llmWebHotkeyCleanupScript,
   llmWebHotkeyInstallScript,
   llmWebHotkeyPollScript,
@@ -47,6 +53,13 @@ interface WebviewLifecycleListeners {
   didStartLoading: (event: unknown) => void;
 }
 
+interface SameOriginDocumentWatcher {
+  revision: number;
+  pointerStartRevision: number | null;
+  pointerLeaf: WorkspaceLeaf | null;
+  dispose(): void;
+}
+
 interface MarkdownEditTarget {
   editor: Editor;
   document: Document;
@@ -64,6 +77,10 @@ const WEB_POLL_INTERVAL_MS = 300;
 const HOTKEY_INSTALL_INTERVAL_MS = 2000;
 /** Polling interval for picking up web hotkey presses. */
 const HOTKEY_POLL_INTERVAL_MS = 300;
+/** Throttle for re-injecting the web auto-trigger script. */
+const AUTOTRIGGER_INSTALL_INTERVAL_MS = 2000;
+/** Polling interval for picking up web auto-trigger selections. */
+const AUTOTRIGGER_POLL_INTERVAL_MS = 300;
 const WEBVIEW_EXECUTION_FAILED = Symbol("webview-execution-failed");
 
 function canExecuteWebviewScript(webview: WebviewElement): boolean {
@@ -139,6 +156,25 @@ export class LlmFeature {
   private currentAbortController: AbortController | null = null;
   private invocationGeneration = 0;
 
+  // ---- Auto-trigger-on-selection (feature 2) ----
+  // Session-level state: NOT persisted. The ribbon toggle resets to off on
+  // every plugin load (per product decision) so a user never gets surprised
+  // by an auto-fire after a restart.
+  private autoTriggerActive = false;
+  private ribbonIconEl: HTMLElement | null = null;
+  private readonly sameOriginDocumentWatchers = new Map<
+    Document,
+    SameOriginDocumentWatcher
+  >();
+  private readonly lastWebAutoTriggerIds = new WeakMap<WorkspaceLeaf, number>();
+
+  // ---- Web auto-trigger injection chain (parallel to menu/hotkey chains). ----
+  private readonly autoTriggerInstallLeaves = new Set<WorkspaceLeaf>();
+  private readonly lastAutoTriggerInstall = new WeakMap<WorkspaceLeaf, number>();
+  /** Prevent concurrent executeJavaScript polls for the same webview. */
+  private readonly autoTriggerPollInFlight = new WeakSet<WorkspaceLeaf>();
+  private autoTriggerPollTimer: number | null = null;
+
   constructor(private readonly plugin: MvObccIdePlugin) {}
 
   private get settings() {
@@ -187,6 +223,8 @@ export class LlmFeature {
     this.plugin.registerEvent(
       this.app.workspace.on("active-leaf-change", () => this.sync()),
     );
+
+    this.refreshRibbon();
     this.sync();
   }
 
@@ -194,6 +232,13 @@ export class LlmFeature {
   tick(): void {
     this.sync();
     this.pollWebMenus();
+    // Keep the ribbon in sync with settings (template added/removed/disabled).
+    this.refreshRibbon();
+  }
+
+  settingsChanged(): void {
+    this.refreshRibbon();
+    this.sync();
   }
 
   /** Re-scan all leaves: attach PDF menus, install/cleanup web menus. */
@@ -203,14 +248,20 @@ export class LlmFeature {
     if (!this.settings.enabled) {
       this.cleanupAllWebMenus();
       this.cleanupAllWebHotkeys();
+      this.cleanupAllWebAutoTriggers();
+      this.cleanupSameOriginDocumentWatchers();
       this.cleanupAllWebviewLifecycles();
       this.stopPolling();
       return;
     }
 
     const seenWebLeaves = new Set<WorkspaceLeaf>();
+    const seenSameOriginDocuments = new Set<Document>();
     this.app.workspace.iterateAllLeaves((leaf) => {
       const viewType = leaf.view.getViewType();
+      if (viewType !== "webviewer") {
+        seenSameOriginDocuments.add(leaf.view.containerEl.ownerDocument);
+      }
       if (viewType === "pdf") {
         this.installPdfMenu(leaf);
       } else if (viewType === "webviewer") {
@@ -219,15 +270,20 @@ export class LlmFeature {
         if (this.isWebviewReady(leaf)) {
           this.installWebMenu(leaf);
           this.installWebHotkeys(leaf);
+          // Auto-trigger injection is gated by the session toggle, so it only
+          // runs while the user has actually turned on the ribbon button.
+          if (this.isAutoTriggerArmed()) this.installWebAutoTrigger(leaf);
         }
       }
     });
+    this.refreshSameOriginDocumentWatchers(seenSameOriginDocuments);
 
     // Cleanup scripts and lifecycle listeners for leaves that disappeared.
     for (const leaf of Array.from(this.webLifecycleLeaves)) {
       if (!seenWebLeaves.has(leaf)) {
         void this.uninstallWebMenu(leaf);
         void this.uninstallWebHotkeys(leaf);
+        void this.uninstallWebAutoTrigger(leaf);
         this.detachWebviewLifecycle(leaf);
       }
     }
@@ -235,6 +291,12 @@ export class LlmFeature {
     for (const leaf of Array.from(this.hotkeyInstallLeaves)) {
       if (!seenWebLeaves.has(leaf)) {
         void this.uninstallWebHotkeys(leaf);
+      }
+    }
+
+    for (const leaf of Array.from(this.autoTriggerInstallLeaves)) {
+      if (!seenWebLeaves.has(leaf)) {
+        void this.uninstallWebAutoTrigger(leaf);
       }
     }
 
@@ -249,6 +311,12 @@ export class LlmFeature {
       }
     }
 
+    // When the auto-trigger session toggle is off, tear down any injected
+    // auto-trigger script across all webviews (mirrors the menu pattern).
+    if (!this.isAutoTriggerArmed()) {
+      this.cleanupAllWebAutoTriggers();
+    }
+
     // Start or stop the polling timer based on the toggle.
     if (this.settings.webContextMenu) {
       this.ensurePolling();
@@ -258,6 +326,13 @@ export class LlmFeature {
 
     // Hotkey polling runs whenever the feature is enabled.
     this.ensureHotkeyPolling();
+
+    // Auto-trigger polling runs only while the session toggle is armed.
+    if (this.isAutoTriggerArmed()) {
+      this.ensureAutoTriggerPolling();
+    } else {
+      this.stopAutoTriggerPolling();
+    }
   }
 
   // ---- Markdown ------------------------------------------------------------
@@ -328,13 +403,16 @@ export class LlmFeature {
       this.webReadyLeaves.add(leaf);
       this.lastWebInstall.set(leaf, 0);
       this.lastHotkeyInstall.set(leaf, 0);
+      this.lastAutoTriggerInstall.set(leaf, 0);
       this.installWebMenu(leaf);
       this.installWebHotkeys(leaf);
+      if (this.isAutoTriggerArmed()) this.installWebAutoTrigger(leaf);
     };
     const didStartLoading = () => {
       this.webReadyLeaves.delete(leaf);
       this.webInstallLeaves.delete(leaf);
       this.hotkeyInstallLeaves.delete(leaf);
+      this.autoTriggerInstallLeaves.delete(leaf);
     };
     try {
       webview.addEventListener("dom-ready", domReady);
@@ -598,8 +676,294 @@ export class LlmFeature {
     this.cancelCurrentInvocation(true);
     this.cleanupAllWebMenus();
     this.cleanupAllWebHotkeys();
+    this.cleanupAllWebAutoTriggers();
+    this.cleanupSameOriginDocumentWatchers();
     this.cleanupAllWebviewLifecycles();
     this.stopPolling();
+    this.removeRibbon();
+  }
+
+  // ---- Web auto-trigger chain (parallel to the menu/hotkey chains above).
+  // Injects a mouseup listener into the page that stashes the finished
+  // selection; the Obsidian side polls it and dispatches the configured
+  // auto-trigger template. Driven by the session-level ribbon toggle.
+
+  private installWebAutoTrigger(leaf: WorkspaceLeaf): void {
+    if (!this.isWebviewReady(leaf)) return;
+    const now = Date.now();
+    const last = this.lastAutoTriggerInstall.get(leaf) ?? 0;
+    if (now - last < AUTOTRIGGER_INSTALL_INTERVAL_MS) return;
+    this.lastAutoTriggerInstall.set(leaf, now);
+
+    const view = leaf.view as WebViewerLike;
+    const webview = view.webview;
+    if (!webview) return;
+    void executeWebviewScript(webview, llmWebAutoTriggerInstallScript()).then(
+      (result) => {
+        if (
+          result !== WEBVIEW_EXECUTION_FAILED &&
+          this.isWebviewReady(leaf)
+        ) {
+          this.autoTriggerInstallLeaves.add(leaf);
+        }
+      },
+    );
+  }
+
+  private async uninstallWebAutoTrigger(
+    leaf: WorkspaceLeaf,
+  ): Promise<void> {
+    const view = leaf.view as WebViewerLike;
+    const webview = view.webview;
+    this.autoTriggerInstallLeaves.delete(leaf);
+    this.lastAutoTriggerInstall.set(leaf, 0);
+    if (!webview || !this.isWebviewReady(leaf)) return;
+    await executeWebviewScript(webview, llmWebAutoTriggerCleanupScript());
+  }
+
+  private cleanupAllWebAutoTriggers(): void {
+    this.stopAutoTriggerPolling();
+    for (const leaf of Array.from(this.autoTriggerInstallLeaves)) {
+      void this.uninstallWebAutoTrigger(leaf);
+    }
+  }
+
+  private ensureAutoTriggerPolling(): void {
+    if (this.autoTriggerPollTimer !== null) return;
+    const id = window.setInterval(
+      () => this.pollWebAutoTrigger(),
+      AUTOTRIGGER_POLL_INTERVAL_MS,
+    );
+    this.autoTriggerPollTimer = this.plugin.registerInterval(id);
+  }
+
+  private stopAutoTriggerPolling(): void {
+    if (this.autoTriggerPollTimer !== null) {
+      window.clearInterval(this.autoTriggerPollTimer);
+      this.autoTriggerPollTimer = null;
+    }
+  }
+
+  private pollWebAutoTrigger(): void {
+    if (!this.isAutoTriggerArmed()) return;
+    const active = activeWorkspaceLeaf(this.app);
+    if (!active || active.view.getViewType() !== "webviewer") return;
+    if (this.autoTriggerPollInFlight.has(active)) return;
+    const view = active.view as WebViewerLike;
+    const webview = view.webview;
+    if (!webview || !this.isWebviewReady(active)) return;
+    this.autoTriggerPollInFlight.add(active);
+    void executeWebviewScript(webview, llmWebAutoTriggerPollScript())
+      .then((result) => {
+        if (result === WEBVIEW_EXECUTION_FAILED) return;
+        const pending = result as LlmWebAutoTriggerPending | null;
+        if (!pending || !pending.text || !pending.text.trim()) return;
+        if (pending.id === this.lastWebAutoTriggerIds.get(active)) return;
+        this.lastWebAutoTriggerIds.set(active, pending.id);
+        const template = this.currentAutoTriggerTemplate();
+        if (!template) return;
+        void this.invokeWithText(template, pending.text, "web");
+      })
+      .catch(() => {
+        // ignore transient webview errors
+      })
+      .finally(() => {
+        this.autoTriggerPollInFlight.delete(active);
+      });
+  }
+
+  // ---- Auto-trigger-on-selection (feature 2): shared helpers + ribbon ----
+
+  /** True when the session toggle is on AND the configured template exists. */
+  private isAutoTriggerArmed(): boolean {
+    return this.autoTriggerActive && this.currentAutoTriggerTemplate() !== null;
+  }
+
+  /** Resolve the configured auto-trigger template (must be enabled), or null. */
+  private currentAutoTriggerTemplate(): LlmPromptTemplate | null {
+    const id = this.settings.autoTriggerTemplateId;
+    if (!id) return null;
+    const tpl = this.settings.templates.find((t) => t.id === id);
+    if (!tpl || !tpl.enabled) return null;
+    return tpl;
+  }
+
+  /**
+   * Keep the left-ribbon button in sync with settings. Called from
+   * `registerMenus`, `tick`, and whenever the auto-trigger setting changes.
+   * Adds the button when a valid template is configured, removes it when not.
+   */
+  refreshRibbon(): void {
+    const tpl = this.currentAutoTriggerTemplate();
+    if (!this.settings.enabled || !tpl) {
+      this.removeRibbon();
+      return;
+    }
+    const tooltip = `划词自动触发：${tpl.label}（点击${this.autoTriggerActive ? "关闭" : "开启"}）`;
+    if (this.ribbonIconEl) {
+      this.ribbonIconEl.setAttribute("aria-label", tooltip);
+      this.ribbonIconEl.setAttribute("data-tooltip", tooltip);
+      this.ribbonIconEl.classList.toggle("is-active", this.autoTriggerActive);
+      return;
+    }
+    this.ribbonIconEl = this.plugin.addRibbonIcon(
+      "wand-2",
+      "划词自动触发",
+      () => this.toggleAutoTrigger(),
+    );
+    this.ribbonIconEl.setAttribute("aria-label", tooltip);
+    this.ribbonIconEl.setAttribute("data-tooltip", tooltip);
+    this.ribbonIconEl.classList.toggle("is-active", this.autoTriggerActive);
+  }
+
+  private removeRibbon(): void {
+    this.ribbonIconEl?.remove();
+    this.ribbonIconEl = null;
+    this.autoTriggerActive = false;
+  }
+
+  private toggleAutoTrigger(): void {
+    this.autoTriggerActive = !this.autoTriggerActive;
+    this.ribbonIconEl?.classList.toggle("is-active", this.autoTriggerActive);
+    const tpl = this.currentAutoTriggerTemplate();
+    if (this.autoTriggerActive && !tpl) {
+      // The configured template is disabled: refuse to arm, explain.
+      this.autoTriggerActive = false;
+      this.ribbonIconEl?.classList.remove("is-active");
+      new Notice("所选模板已被关闭，请先在设置里启用它或另选一个。", 4000);
+      return;
+    }
+    // Re-sync the webview injection + polling whenever the toggle flips.
+    this.sync();
+    new Notice(
+      this.autoTriggerActive
+        ? tpl
+          ? `已开启划词自动触发：${tpl.label}`
+          : "已开启划词自动触发"
+        : "已关闭划词自动触发",
+      3000,
+    );
+    const tooltip = tpl
+      ? `划词自动触发：${tpl.label}（点击${this.autoTriggerActive ? "关闭" : "开启"}）`
+      : "划词自动触发";
+    this.ribbonIconEl?.setAttribute("aria-label", tooltip);
+    this.ribbonIconEl?.setAttribute("data-tooltip", tooltip);
+  }
+
+  private refreshSameOriginDocumentWatchers(documents: Set<Document>): void {
+    for (const document of documents) {
+      if (!this.sameOriginDocumentWatchers.has(document)) {
+        this.watchSameOriginDocument(document);
+      }
+    }
+    for (const [document, watcher] of this.sameOriginDocumentWatchers) {
+      if (documents.has(document)) continue;
+      watcher.dispose();
+      this.sameOriginDocumentWatchers.delete(document);
+    }
+  }
+
+  private watchSameOriginDocument(document: Document): void {
+    const watcher: SameOriginDocumentWatcher = {
+      revision: 0,
+      pointerStartRevision: null,
+      pointerLeaf: null,
+      dispose: () => {},
+    };
+    const onSelectionChange = () => {
+      watcher.revision += 1;
+    };
+    const onMouseDown = (event: MouseEvent) => {
+      watcher.pointerStartRevision = null;
+      watcher.pointerLeaf = null;
+      if (event.button !== 0 || this.isResultSurfaceTarget(event.target)) return;
+      const leaf = this.sameOriginLeafForTarget(document, event.target);
+      if (!leaf) return;
+      watcher.pointerStartRevision = watcher.revision;
+      watcher.pointerLeaf = leaf;
+    };
+    const onMouseUp = (event: MouseEvent) => {
+      const startRevision = watcher.pointerStartRevision;
+      const pointerLeaf = watcher.pointerLeaf;
+      watcher.pointerStartRevision = null;
+      watcher.pointerLeaf = null;
+      if (
+        startRevision === null ||
+        !pointerLeaf ||
+        this.isResultSurfaceTarget(event.target)
+      ) {
+        return;
+      }
+      window.setTimeout(() => {
+        if (
+          this.sameOriginDocumentWatchers.get(document) !== watcher ||
+          watcher.revision <= startRevision
+        ) {
+          return;
+        }
+        void this.onSameOriginSelection(pointerLeaf);
+      }, 0);
+    };
+    document.addEventListener("selectionchange", onSelectionChange);
+    document.addEventListener("mousedown", onMouseDown, true);
+    document.addEventListener("mouseup", onMouseUp, true);
+    watcher.dispose = () => {
+      document.removeEventListener("selectionchange", onSelectionChange);
+      document.removeEventListener("mousedown", onMouseDown, true);
+      document.removeEventListener("mouseup", onMouseUp, true);
+    };
+    this.sameOriginDocumentWatchers.set(document, watcher);
+  }
+
+  private cleanupSameOriginDocumentWatchers(): void {
+    for (const watcher of this.sameOriginDocumentWatchers.values()) {
+      watcher.dispose();
+    }
+    this.sameOriginDocumentWatchers.clear();
+  }
+
+  private isResultSurfaceTarget(target: EventTarget | null): boolean {
+    const candidate = target as {
+      closest?: (selector: string) => Element | null;
+    } | null;
+    return (
+      typeof candidate?.closest === "function" &&
+      candidate.closest(".mv-obcc-llm-popover") !== null
+    );
+  }
+
+  private sameOriginLeafForTarget(
+    document: Document,
+    target: EventTarget | null,
+  ): WorkspaceLeaf | null {
+    if (!target || typeof (target as Node).nodeType !== "number") return null;
+    let match: WorkspaceLeaf | null = null;
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      if (match || leaf.view.getViewType() === "webviewer") return;
+      const container = leaf.view.containerEl;
+      if (
+        container.ownerDocument === document &&
+        container.contains(target as Node)
+      ) {
+        match = leaf;
+      }
+    });
+    return match;
+  }
+
+  private async onSameOriginSelection(leaf: WorkspaceLeaf): Promise<void> {
+    if (!this.isAutoTriggerArmed()) return;
+    const template = this.currentAutoTriggerTemplate();
+    if (!template) return;
+    const editTarget = this.captureMarkdownTarget(leaf);
+    const state = await currentWorkspaceContext(this.app, leaf);
+    if (!state || !state.selection.text.trim()) return;
+    await this.invokeWithText(
+      template,
+      state.selection.text,
+      state.resourceType ?? "view",
+      editTarget,
+    );
   }
 
   // ---- LLM invocation ------------------------------------------------------
@@ -637,6 +1001,42 @@ export class LlmFeature {
     );
   }
 
+  /**
+   * Build a fresh result surface. Seeds the window with the remembered
+   * `windowGeometry` (so even after a user-close the next invoke is born where
+   * the window last was) and persists any drag/resize into `windowGeometry`
+   * via the `onGeometryChange` callback (cross-session).
+   */
+  private createSurface(
+    editTarget: MarkdownEditTarget | null,
+    onInsert: ((text: string) => void) | undefined,
+    onReplace: ((text: string) => void) | undefined,
+  ): LlmResultSurface {
+    // Bind the closure to this local; `this.currentSurface` may already point
+    // to a newer surface by the time onClose fires (e.g. a re-trigger raced),
+    // so the guard inside onClose still compares against the same instance.
+    const surface = new LlmResultSurface(this.app, {
+      document:
+        editTarget?.document ??
+        activeWorkspaceLeaf(this.app)?.view.containerEl.ownerDocument,
+      geometry: this.settings.windowGeometry ?? undefined,
+      onInsert,
+      onReplace,
+      onGeometryChange: (geo) => {
+        this.plugin.settings.llm.windowGeometry = geo;
+        void this.plugin.saveData(this.plugin.settings);
+      },
+      onClose: () => {
+        if (this.currentSurface !== surface) return;
+        this.currentSurface = null;
+        this.currentAbortController?.abort();
+        this.currentAbortController = null;
+        this.invocationGeneration += 1;
+      },
+    });
+    return surface;
+  }
+
   /** Run a template in the single reusable non-modal result surface. */
   private async invokeWithText(
     template: LlmPromptTemplate,
@@ -657,28 +1057,36 @@ export class LlmFeature {
         : undefined;
 
     registerTempIgnoreFilter(this.app);
-    this.cancelCurrentInvocation(true);
+
+    // ---- Pinned-window reuse ----
+    // 当悬浮窗被固定且仍存活时，复用它：中止旧流但不关窗，
+    // 清空旧内容让新结果流进同一窗口的同一位置。否则销毁重建，但用记住的
+    // 几何信息让新窗口在原地弹出。
+    const reuse =
+      this.currentSurface !== null &&
+      this.currentSurface.isOpen &&
+      this.currentSurface.isPinned;
+
+    let surface: LlmResultSurface;
+    if (reuse && this.currentSurface) {
+      surface = this.currentSurface;
+      // Abort the old invocation but keep the window on screen, then wipe its
+      // content for the new stream.
+      this.invocationGeneration += 1;
+      this.currentAbortController?.abort();
+      // Re-point the toolbar's 替换选区/插入到光标处 buttons at the NEW
+      // selection's edit target (a reused window otherwise keeps the old one).
+      surface.updateCallbacks(onInsert, onReplace);
+      surface.reset();
+    } else {
+      this.cancelCurrentInvocation(true);
+      surface = this.createSurface(editTarget, onInsert, onReplace);
+      this.currentSurface = surface;
+      surface.open();
+    }
     const generation = ++this.invocationGeneration;
     const abortController = new AbortController();
     this.currentAbortController = abortController;
-
-    let surface: LlmResultSurface;
-    surface = new LlmResultSurface(this.app, {
-      document:
-        editTarget?.document ??
-        this.app.workspace.activeLeaf?.view.containerEl.ownerDocument,
-      onInsert,
-      onReplace,
-      onClose: () => {
-        if (this.currentSurface !== surface) return;
-        this.currentSurface = null;
-        this.currentAbortController?.abort();
-        this.currentAbortController = null;
-        this.invocationGeneration += 1;
-      },
-    });
-    this.currentSurface = surface;
-    surface.open();
 
     try {
       const target = resolveProvider(this.settings, template);
