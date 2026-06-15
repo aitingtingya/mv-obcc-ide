@@ -10,31 +10,37 @@
 
 ## 安装指南
 
-安装过程主要分为三个阶段：**构建**、**Obsidian 侧配置**以及 **Claude Code 侧配置**。
+安装本插件有两种方式：**手动安装（最快最方便，无需编译）** 或 **从源码自行构建**。
 
-### 1. 构建项目 (Build)
-本项目的核心执行文件需要通过源码编译生成。
-如果您通过克隆或下载了本仓库的源码，请首先在项目根目录下执行以下命令来构建产物：
+### 方法一：手动从 Release 安装（推荐，适合非开发者）
 
-```bash
-# 安装所需依赖项
-npm ci
-
-# 编译并构建项目
-npm run build
-```
-> **注意**：必须完成 `npm run build` 构建步骤，因为 Obsidian 插件所需的 `main.js` 文件仅在构建完成后才会在 `dist/` 目录中生成。
-
-### 2. Obsidian 侧配置
-构建完成后，需要将生成的产物放入您的 Obsidian Vault 插件目录中。
-
-1. 在您的 Obsidian Vault 的插件目录下新建文件夹，路径为：`<vault>/.obsidian/plugins/mv-obcc/`
-2. 将构建好的以下三个文件复制到该新文件夹中：
-   - `dist/main.js` (复制后需要确保文件名为 `main.js`)
+1. 前往 GitHub 仓库的 [Releases](https://github.com/aitingtingya/mv-obcc/releases) 页面，下载最新版本（如 `0.3.5`）的以下三个资产文件：
+   - `main.js`
    - `manifest.json`
    - `styles.css`
-3. 重启或刷新 Obsidian，进入**设置 -> 第三方插件**，找到 `MV OBCC` 并启用它。
+2. 在您的 Obsidian Vault 插件目录下新建文件夹，路径为：`<vault>/.obsidian/plugins/mv-obcc/`
+3. 将下载的这三个文件复制到该文件夹中。
+4. 重启或刷新 Obsidian，进入**设置 -> 第三方插件**，找到 `MV OBCC` 并启用它。
    *(注意：请确保关闭同 Vault 下的其他 Claude Code IDE 桥接插件以避免冲突)*
+
+### 方法二：从源码构建安装
+
+如果您通过克隆或下载了本仓库的源码，请执行以下命令来构建产物：
+
+1. 在项目根目录下执行编译构建：
+   ```bash
+   # 安装所需依赖项
+   npm ci
+
+   # 编译并构建项目
+   npm run build
+   ```
+2. 在您的 Obsidian Vault 的插件目录下新建文件夹，路径为：`<vault>/.obsidian/plugins/mv-obcc/`
+3. 将构建生成的以下三个文件复制到该文件夹中：
+   - `dist/main.js` (复制到目标文件夹后，需要确保文件名为 `main.js`)
+   - `manifest.json`
+   - `styles.css`
+4. 重启或刷新 Obsidian，在**第三方插件**中启用它。
 
 ### 3. Claude Code 侧配置
 1. 确保 Obsidian 已启动且 `MV OBCC` 插件处于启用状态。
