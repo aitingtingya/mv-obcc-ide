@@ -1,6 +1,6 @@
 {
   "name": "mv-obcc",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "A focused Claude Code IDE bridge for Obsidian.",
   "main": "main.js",
   "type": "module",

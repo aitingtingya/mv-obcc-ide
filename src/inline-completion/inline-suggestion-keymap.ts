@@ -10,6 +10,10 @@ import {
   hasSuggestion,
   readSuggestion,
 } from "./inline-suggestion-state";
+import {
+  matchInlineHotkey,
+  parseInlineHotkey,
+} from "./inline-hotkey-format";
 
 /**
  * Per-view keymap for inline completion, registered at the highest precedence
@@ -36,6 +40,17 @@ function normalizeKey(raw: string): string {
   return (raw ?? "").trim();
 }
 
+function isMacLikePlatform(): boolean {
+  const nav =
+    typeof activeWindow !== "undefined" ? activeWindow.navigator : navigator;
+  return nav.platform.toLowerCase().includes("mac");
+}
+
+interface InlineHotkeyAction {
+  key: string;
+  run: (view: EditorView) => boolean;
+}
+
 /**
  * Build the keymap extension from current settings + handlers. Entries with
  * empty bindings are skipped. Every handler first checks that a suggestion is
@@ -45,12 +60,14 @@ function normalizeKey(raw: string): string {
 export function buildKeymapExtension(
   bindingsConfig: InlineCompletionKeymap,
   handlers: KeymapHandlers,
+  isMacLike = isMacLikePlatform(),
 ): Extension {
   const bindings: KeyBinding[] = [];
+  const actions: InlineHotkeyAction[] = [];
 
   const accept = normalizeKey(bindingsConfig.accept);
-  if (accept) {
-    bindings.push({
+  if (accept && parseInlineHotkey(accept)) {
+    actions.push({
       key: accept,
       run: (v) => {
         if (!hasSuggestion(v)) return false;
@@ -61,8 +78,8 @@ export function buildKeymapExtension(
   }
 
   const reject = normalizeKey(bindingsConfig.reject);
-  if (reject) {
-    bindings.push({
+  if (reject && parseInlineHotkey(reject)) {
+    actions.push({
       key: reject,
       run: (v) => {
         if (!hasSuggestion(v)) return false;
@@ -75,8 +92,8 @@ export function buildKeymapExtension(
   }
 
   const cancel = normalizeKey(bindingsConfig.cancel);
-  if (cancel) {
-    bindings.push({
+  if (cancel && parseInlineHotkey(cancel)) {
+    actions.push({
       key: cancel,
       run: (v) => {
         if (!hasSuggestion(v)) return false;
@@ -87,10 +104,30 @@ export function buildKeymapExtension(
   }
 
   const request = normalizeKey(bindingsConfig.request);
-  if (request) {
-    bindings.push({
+  if (request && parseInlineHotkey(request)) {
+    actions.push({
       key: request,
       run: (v) => handlers.onRequest(v),
+    });
+  }
+
+  for (const action of actions) {
+    bindings.push({
+      key: action.key,
+      run: action.run,
+    });
+  }
+
+  if (actions.length > 0) {
+    bindings.push({
+      any: (view, event) => {
+        for (const action of actions) {
+          if (matchInlineHotkey(action.key, event, isMacLike)) {
+            return action.run(view);
+          }
+        }
+        return false;
+      },
     });
   }
 
