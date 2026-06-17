@@ -124,7 +124,7 @@
 
 ## 鸣谢
 
-行内补全的 CodeMirror ghost-text 架构设计参考了开发过程中提供的本地参考插件 [obsidian-github-copilot](https://github.com/Pierrad/obsidian-github-copilot)。mv-SenceAI 在运行时并未捆绑或依赖该插件。
+行内补全的 CodeMirror ghost-text 架构设计参考了插件 [obsidian-github-copilot](https://github.com/Pierrad/obsidian-github-copilot)。
 
 ---
 
@@ -202,4 +202,4 @@ If you prefer to clone and compile the source code yourself:
 
 ## Acknowledgements
 
-The CodeMirror ghost-text architecture for Inline Completion was informed by the local reference plugin [obsidian-github-copilot](https://github.com/Pierrad/obsidian-github-copilot) provided during development. mv-SenceAI does not bundle or depend on that plugin at runtime.
+The CodeMirror ghost-text architecture for Inline Completion was informed by plugin [obsidian-github-copilot](https://github.com/Pierrad/obsidian-github-copilot). mv-SenceAI does not bundle or depend on that plugin at runtime.
