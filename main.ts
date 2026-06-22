@@ -90,8 +90,12 @@ export default class MvSenceAiIdePlugin extends Plugin {
   private selectionHighlighter: SelectionHighlightController | null = null;
   private llmFeature: LlmFeature | null = null;
   private inlineCompletion: InlineCompletionFeature | null = null;
+  private mcpRegistrationTimer: number | null = null;
+  private mcpRegistrationInFlight: Promise<void> | null = null;
+  private unloaded = false;
 
   async onload(): Promise<void> {
+    this.unloaded = false;
     const loaded = (await this.loadData()) as Partial<BridgeSettings> | null;
     this.settings = {
       ...DEFAULT_SETTINGS,
@@ -208,7 +212,6 @@ export default class MvSenceAiIdePlugin extends Plugin {
     this.llmFeature.registerMenus();
 
     await this.startBridge();
-    await this.saveData(this.settings);
     this.terminalTracker.scan();
     this.selectionHighlighter.sync(true);
     this.scheduleBroadcast();
@@ -219,6 +222,8 @@ export default class MvSenceAiIdePlugin extends Plugin {
       activeWindow.clearTimeout(this.broadcastTimer);
       this.broadcastTimer = null;
     }
+    this.unloaded = true;
+    this.clearScheduledMcpRegistration();
     this.selectionHighlighter?.destroy();
     this.selectionHighlighter = null;
     this.llmFeature?.dispose();
@@ -229,9 +234,9 @@ export default class MvSenceAiIdePlugin extends Plugin {
   }
 
   async saveAndApplySettings(): Promise<void> {
-    await this.applyClaudeSettings();
-    await this.syncMcpRegistration();
+    await this.applyClaudeSettingsBestEffort(true);
     await this.saveData(this.settings);
+    this.scheduleMcpRegistration(true);
   }
 
   refreshLlmFeature(): void {
@@ -277,8 +282,8 @@ export default class MvSenceAiIdePlugin extends Plugin {
   }
 
   async retryMcpRegistration(): Promise<void> {
-    await this.syncMcpRegistration(true);
-    await this.saveData(this.settings);
+    this.clearScheduledMcpRegistration();
+    await this.runMcpRegistration(true);
   }
 
   async cleanMcpRegistration(): Promise<void> {
@@ -313,9 +318,9 @@ export default class MvSenceAiIdePlugin extends Plugin {
     });
     this.port = await this.server.start();
     writeLockFile(this.port, vaultRoot, authToken);
-    await this.applyClaudeSettings();
-    await this.syncMcpRegistration();
+    await this.applyClaudeSettingsBestEffort();
     await this.saveData(this.settings);
+    this.scheduleMcpRegistration();
     console.log(`[mv-senceai-ide] listening on 127.0.0.1:${this.port}`);
   }
 
@@ -347,6 +352,17 @@ export default class MvSenceAiIdePlugin extends Plugin {
       );
     } else {
       this.settings = restoreManagedBaseUrl(filePath, this.settings);
+    }
+  }
+
+  private async applyClaudeSettingsBestEffort(notify = false): Promise<void> {
+    try {
+      await this.applyClaudeSettings();
+    } catch (error) {
+      console.warn("[mv-senceai-ide] Claude settings sync failed", error);
+      if (notify) {
+        new Notice("Claude 设置同步失败，但插件已继续运行。详情见控制台。");
+      }
     }
   }
 
@@ -425,6 +441,72 @@ export default class MvSenceAiIdePlugin extends Plugin {
       this.broadcastTimer = null;
       void this.broadcastSelection();
     }, 100);
+  }
+
+  private clearScheduledMcpRegistration(): void {
+    if (this.mcpRegistrationTimer === null) return;
+    activeWindow.clearTimeout(this.mcpRegistrationTimer);
+    this.mcpRegistrationTimer = null;
+  }
+
+  private scheduleMcpRegistration(force = false): void {
+    this.clearScheduledMcpRegistration();
+    if (!this.port) return;
+
+    const url = this.currentMcpUrl();
+    if (
+      !force &&
+      this.settings.mcpEnabled &&
+      this.settings.registeredMcpUrl === url
+    ) {
+      this.mcpStatus = "MCP 已连接";
+      return;
+    }
+
+    this.mcpStatus = this.settings.mcpEnabled
+      ? "MCP 后台检查中"
+      : "MCP 已关闭";
+    this.mcpRegistrationTimer = activeWindow.setTimeout(() => {
+      this.mcpRegistrationTimer = null;
+      void this.runMcpRegistration(force);
+    }, 0);
+  }
+
+  private async runMcpRegistration(force = false): Promise<void> {
+    if (this.mcpRegistrationInFlight) {
+      if (!force) {
+        await this.mcpRegistrationInFlight;
+        return;
+      }
+      await this.mcpRegistrationInFlight;
+    }
+
+    const task = this.performMcpRegistration(force);
+    this.mcpRegistrationInFlight = task;
+    try {
+      await task;
+    } finally {
+      if (this.mcpRegistrationInFlight === task) {
+        this.mcpRegistrationInFlight = null;
+      }
+    }
+  }
+
+  private async performMcpRegistration(force: boolean): Promise<void> {
+    try {
+      await this.syncMcpRegistration(force);
+      if (!this.unloaded) await this.saveData(this.settings);
+    } catch (error) {
+      console.warn("[mv-senceai-ide] MCP registration failed", error);
+      this.mcpStatus = `注册失败：${
+        error instanceof Error ? error.message : String(error)
+      }`;
+      if (!this.unloaded) await this.saveData(this.settings);
+    }
+  }
+
+  private currentMcpUrl(): string | null {
+    return this.port ? `http://127.0.0.1:${this.port}/mcp` : null;
   }
 
   private async broadcastSelection(): Promise<void> {
@@ -535,12 +617,10 @@ export default class MvSenceAiIdePlugin extends Plugin {
       }
       return;
     }
-    const url = `http://127.0.0.1:${this.port}/mcp`;
-    if (
-      !force &&
-      this.settings.registeredMcpUrl === url &&
-      this.mcpStatus.startsWith("MCP 已")
-    ) {
+    const url = this.currentMcpUrl();
+    if (!url) return;
+    if (!force && this.settings.registeredMcpUrl === url) {
+      this.mcpStatus = "MCP 已连接";
       return;
     }
     const result = await ensureMcpRegistration(
